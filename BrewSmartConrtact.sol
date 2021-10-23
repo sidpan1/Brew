@@ -201,7 +201,7 @@ contract BrewAccountFactory is AccountFactory, Ownable {
     using Clones for address;
     
     function CreateAccount(address account_template_address) public onlyOwner returns (address) {
-        require(account_template_address != address(0), "account_template must be set");
+        require(account_template_address != address(0), "account_template_address must be a no zero address.");
         address account_address = account_template_address.clone();
         
         return account_address; 
@@ -226,7 +226,7 @@ contract BrewInvestmentManager is InvestmentManager, Ownable {
     }
 }
 
-contract BrewCommissionableAccount is Initializable, OwnableUpgradeable, CommissionableAccount {
+abstract contract BrewCommissionableAccount is Initializable, OwnableUpgradeable, CommissionableAccount {
     uint256 public commission_rate_bps;
     address public commission_address;
     address public beneficiary_address;
@@ -241,6 +241,17 @@ contract BrewCommissionableAccount is Initializable, OwnableUpgradeable, Commiss
     function CalculateCommission(uint256 amount) internal view returns (uint256){
         return (amount * commission_rate_bps)/10000;
     }
+    
+    function GetAccountTokenAddress() public virtual returns (address);
+    
+    function TransferWithCommission(uint256 total_amount, uint256 commission_amount) internal {
+        ERC20Utils.TransferFromSelf(commission_amount, GetAccountTokenAddress() , commission_address);
+        ERC20Utils.TransferFromSelf(total_amount - commission_amount, GetAccountTokenAddress() , beneficiary_address);
+    }
+    
+    function TransferWithoutCommission(uint256 total_amount) internal {
+        ERC20Utils.TransferFromSelf(total_amount, GetAccountTokenAddress(), beneficiary_address);
+    }
 }
 
 contract CurveAaveDaiInvestableAccount is Investable, BrewCommissionableAccount {
@@ -250,16 +261,20 @@ contract CurveAaveDaiInvestableAccount is Investable, BrewCommissionableAccount 
     
     uint256 public principal_amount;
     
+    function GetAccountTokenAddress() public override view returns (address) {
+        return DAI_ADDRESS;
+    }
+    
     function Deposit(uint256 amount) public onlyOwner virtual returns (uint256) {
         // Transfer the amount from the owner who has already approved this transfer.
-        ERC20Utils.ApprovedTransferToSelf(amount, DAI_ADDRESS, beneficiary_address);
+        ERC20Utils.ApprovedTransferToSelf(amount, GetAccountTokenAddress(), beneficiary_address);
         
         return DepositFromSelf(amount);
     }
     
     function DepositFromSelf(uint256 amount) internal returns (uint256) {
         // Approve the allowance of the curve aave smart contract.
-        ERC20Utils.Approve(amount, DAI_ADDRESS, CURVE_AAVE_LP_TOKEN_ADDRESS);
+        ERC20Utils.Approve(amount, GetAccountTokenAddress(), CURVE_AAVE_LP_TOKEN_ADDRESS);
         
         uint256 minted_lp_token_amount = StableSwapAave(CURVE_AAVE_STABLE_SWAP_SMART_CONTRACT_ADDRESS).add_liquidity([amount, 0, 0], 0, false);
         
@@ -269,7 +284,7 @@ contract CurveAaveDaiInvestableAccount is Investable, BrewCommissionableAccount 
     }
     
     function Withdraw(uint256 lp_token_amount) public onlyOwner virtual {
-        require(ERC20Utils.HasBalance(lp_token_amount, CURVE_AAVE_LP_TOKEN_ADDRESS));
+        ERC20Utils.RequireMinBalance(lp_token_amount, CURVE_AAVE_LP_TOKEN_ADDRESS);
         
         uint256 withdrawn_amount = StableSwapAave(CURVE_AAVE_STABLE_SWAP_SMART_CONTRACT_ADDRESS).remove_liquidity_one_coin(lp_token_amount, 0, 0, false);
 
@@ -296,24 +311,15 @@ contract CurveAaveDaiInvestableAccount is Investable, BrewCommissionableAccount 
     }
     
     function WithdrawRewards(address exchange_manager_address) public onlyOwner virtual {
-        revert("This contract does not support rewards.");
+        // Do nothing. This contract does not support rewards.
     }
     
     function WithdrawAllWithRewards(address exchange_manager_address) public onlyOwner virtual {
-        revert("This contract does not support rewards.");
+        WithdrawAll();
     }
     
     function ReinvestRewards(address exchange_manager_address) public onlyOwner virtual {
-        revert("This contract does not support rewards.");
-    }
-    
-    function TransferWithCommission(uint256 total_amount, uint256 commission_amount) internal {
-        ERC20Utils.TransferFromSelf(commission_amount, DAI_ADDRESS, commission_address);
-        ERC20Utils.TransferFromSelf(total_amount - commission_amount, DAI_ADDRESS, beneficiary_address);
-    }
-    
-    function TransferWithoutCommission(uint256 total_amount) internal {
-        ERC20Utils.TransferFromSelf(total_amount, DAI_ADDRESS, beneficiary_address);
+        // Do nothing. This contract does not support rewards.
     }
 }
 
@@ -338,6 +344,8 @@ contract CurveAaveDaiInvestableAccountWithRewards is CurveAaveDaiInvestableAccou
     }
     
     function Withdraw(uint256 gauge_token_amount) public override onlyOwner {
+        ERC20Utils.RequireMinBalance(gauge_token_amount, LIQUIDITY_GAUGE_TOKEN_ADDRESS);
+        
         LiquidityGauge(LIQUIDITY_GAUGE_CONTRACT_ADDRESS).withdraw(gauge_token_amount, false);
         
         CurveAaveDaiInvestableAccount.Withdraw(gauge_token_amount);
@@ -349,8 +357,8 @@ contract CurveAaveDaiInvestableAccountWithRewards is CurveAaveDaiInvestableAccou
     }
     
     function WithdrawRewards(address exchange_manager_address) public onlyOwner override {
-        uint256 return_amount = ClaimAndExchangeRewards(exchange_manager_address);
-        WithdrawRewardsAfterCommission(return_amount);
+        uint256 returns_amount = ClaimAndExchangeRewards(exchange_manager_address);
+        WithdrawRewardsAfterCommission(returns_amount);
     }
     
     function WithdrawAllWithRewards(address exchange_manager_address) public override onlyOwner  {
@@ -359,18 +367,18 @@ contract CurveAaveDaiInvestableAccountWithRewards is CurveAaveDaiInvestableAccou
     }
     
     function ReinvestRewards(address exchange_manager_address) public override {
-        uint256 return_amount = ClaimAndExchangeRewards(exchange_manager_address);
-        ReinvestRewardsAfterCommission(return_amount);
+        uint256 returns_amount = ClaimAndExchangeRewards(exchange_manager_address);
+        ReinvestRewardsAfterCommission(returns_amount);
     }
     
     function ClaimAndExchangeRewards(address exchange_manager_address) internal returns (uint256) {
         LiquidityGauge(LIQUIDITY_GAUGE_CONTRACT_ADDRESS).claim_rewards();
         
-        uint256 return_amount = 0;
-        return_amount = return_amount + ExchangeRewards(exchange_manager_address, WMATIC_TOKEN_ADDRESS);
-        return_amount = return_amount + ExchangeRewards(exchange_manager_address, CRV_TOKEN_ADDRESS);
+        uint256 returns_amount = 0;
+        returns_amount = returns_amount + ExchangeRewards(exchange_manager_address, WMATIC_TOKEN_ADDRESS);
+        returns_amount = returns_amount + ExchangeRewards(exchange_manager_address, CRV_TOKEN_ADDRESS);
         
-        return return_amount;
+        return returns_amount;
     }
     
     function ExchangeRewards(address exchange_manager_address, address reward_token_address) internal returns (uint256){
@@ -378,22 +386,22 @@ contract CurveAaveDaiInvestableAccountWithRewards is CurveAaveDaiInvestableAccou
         
         uint256 balance_amount = ERC20Utils.GetBalance(reward_token_address);
         ERC20Utils.Approve(balance_amount, reward_token_address, exchange_manager_address);
-        return exchange_manager.exchange(WMATIC_TOKEN_ADDRESS, DAI_ADDRESS, balance_amount);
+        return exchange_manager.exchange(reward_token_address, GetAccountTokenAddress(), balance_amount);
     }
     
-    function WithdrawRewardsAfterCommission(uint256 return_amount) internal {
-        uint256 commission_amount = CalculateCommission(return_amount);
-        TransferWithCommission(return_amount, commission_amount);
+    function WithdrawRewardsAfterCommission(uint256 returns_amount) internal {
+        uint256 commission_amount = CalculateCommission(returns_amount);
+        TransferWithCommission(returns_amount, commission_amount);
     }
     
-    function ReinvestRewardsAfterCommission(uint256 return_amount) internal {
-        uint256 commission_amount = CalculateCommission(return_amount);
-        uint256 reinvest_amount = return_amount - commission_amount;
+    function ReinvestRewardsAfterCommission(uint256 returns_amount) internal {
+        uint256 commission_amount = CalculateCommission(returns_amount);
+        uint256 reinvest_amount = returns_amount - commission_amount;
         
         reinvested_amount = reinvested_amount + reinvest_amount;
         
         CurveAaveDaiInvestableAccount.DepositFromSelf(reinvest_amount);
-        ERC20Utils.TransferFromSelf(commission_amount, DAI_ADDRESS, commission_address);
+        ERC20Utils.TransferFromSelf(commission_amount, GetAccountTokenAddress(), commission_address);
     }
     
 }
@@ -405,7 +413,7 @@ contract Brew1InchExchangeManager is ExchangeManager {
     
     function exchange(address from_token, address to_token, uint256 amount) public payable returns (uint256){
         // Transfer the amount from the account which has already approved this transfer.
-        ERC20Utils.ApprovedTransferToSelf(amount, DAI_ADDRESS, beneficiary_address);
+        ERC20Utils.ApprovedTransferToSelf(amount, from_token, msg.sender);
         
         // Approve the allowance of the one inch smart contract.
         ERC20Utils.Approve(amount, from_token, ONE_INCH_SMART_CONTRACT_ADDRESS);
@@ -436,7 +444,11 @@ library ERC20Utils {
         return IERC20(token_address).balanceOf(address(this));
     } 
     
-    function HasBalance(uint256 amount, address token_address) internal view returns (bool) {
-        return IERC20(token_address).balanceOf(address(this)) >= amount;
+    function RequireMinBalance(uint256 amount, address token_address) internal view {
+        require(IERC20(token_address).balanceOf(address(this)) >= amount, "Insufficient balance.");
     } 
 }
+    
+    
+    
+    
